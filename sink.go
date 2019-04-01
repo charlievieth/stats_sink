@@ -567,6 +567,7 @@ func (c *ConnSink) handleErr(err error) {
 		if c.conn != nil {
 			// CEV: Flush() won't block if there was a previous write error
 			c.bw.Flush()
+			// WARN: make sure we don't double count
 			atomic.AddInt64(&c.dropppedBytes, int64(c.bw.Buffered()))
 			c.conn.Close()
 			c.conn = nil
@@ -592,7 +593,9 @@ func (c *ConnSink) Write(p []byte) (int, error) {
 		return 0, ErrConnectionClosed
 	}
 
-	if c.status.Is(statusReconnecting) {
+	// if reconnecting make sure we haven't exceeded the reconnect
+	// buffer size.
+	if c.status.Reconnecting() {
 		c.bw.Flush()
 		if c.pending.Len() >= c.Opts.ReconnectBufSize {
 			c.mu.Unlock()
