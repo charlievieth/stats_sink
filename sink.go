@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net"
 	"net/url"
 	"runtime"
@@ -16,6 +17,10 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 // TODO (CEV): Consider removing these
 
@@ -93,6 +98,8 @@ type CustomDialer interface {
 	Dial(network, address string) (net.Conn, error)
 }
 
+// TODO (CEV): organize options
+//
 // Options can be used to create a customized connection.
 type Options struct {
 	// URL is the statsd server the client will connect and send stats to.
@@ -138,6 +145,10 @@ type Options struct {
 
 	// TODO: set a no-op logger
 	Log Logger
+
+	// NoRandomizeHosts configures whether we randomize the order of hosts when
+	// connecting.
+	NoRandomizeHosts bool
 }
 
 func (o Options) Connect() (*ConnSink, error) {
@@ -171,17 +182,6 @@ func (o Options) Connect() (*ConnSink, error) {
 		return nil, err
 	}
 	return cs, nil
-}
-
-func (o *Options) dial(network, address string) (net.Conn, error) {
-	if o.CustomDialer != nil {
-		return o.CustomDialer.Dial(network, address)
-	}
-	// TODO: set KeepAlive ???
-	d := net.Dialer{
-		Timeout: o.DialTimeout,
-	}
-	return d.Dial(network, address)
 }
 
 // WARN: make sure we use all of these
@@ -219,7 +219,7 @@ type ConnSink struct {
 	// flushing
 	wg    sync.WaitGroup
 	flush chan chan struct{}
-	err   error
+	err   error // WARN (CEV): what actually checks this ???
 
 	// last connect attempt
 	lastAttempt time.Time
@@ -295,11 +295,22 @@ func (c *ConnSink) connect() error {
 		hosts = append(hosts, c.url.Host)
 	}
 
-	// TODO: add option to randomize address connect order
-	//
+	if len(hosts) > 1 && !c.Opts.NoRandomizeHosts {
+		rand.Shuffle(len(hosts), func(i, j int) {
+			hosts[i], hosts[j] = hosts[j], hosts[i]
+		})
+	}
+
+	dialer := c.Opts.CustomDialer
+	if dialer == nil {
+		dialer = &net.Dialer{
+			Timeout: c.Opts.DialTimeout / time.Duration(len(hosts)),
+		}
+	}
+
 	var err error
 	for _, host := range hosts {
-		c.conn, err = c.Opts.dial(c.url.Scheme, host)
+		c.conn, err = dialer.Dial(c.url.Scheme, host)
 		if err == nil {
 			break
 		}
@@ -360,7 +371,7 @@ func (c *ConnSink) FlushTimeout(timeout time.Duration) error {
 func (c *ConnSink) Flush() {
 	if err := c.FlushTimeout(time.Second * 10); err != nil {
 		if c.Opts.Log != nil {
-			c.Opts.Log.Error("[stats] flush:", err)
+			c.Opts.Log.Error("[stats] flush: " + err.Error())
 		}
 	}
 }
@@ -552,11 +563,14 @@ func (c *ConnSink) reconnect() {
 }
 
 func (c *ConnSink) handleErr(err error) {
+	if err == nil {
+		panic("handleErr: called with nil error")
+	}
 	if c.Opts.Log != nil {
-		c.Opts.Log.Error("[stats] write:", err)
+		c.Opts.Log.Error("[stats] write: " + err.Error())
 	}
 
-	c.mu.Lock()
+	c.mu.Lock() // TODO (CEV): make sure there isn't a race with c.Opts.Log
 	if c.status.Is(statusConnecting | statusClosed | statusReconnecting) {
 		c.mu.Unlock()
 		return
@@ -581,7 +595,7 @@ func (c *ConnSink) handleErr(err error) {
 	}
 
 	c.status = statusDisconnected
-	c.err = err
+	c.err = err // WARN (CEV): what actually checks this ???
 	c.mu.Unlock()
 	c.Close()
 }
