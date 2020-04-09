@@ -5,7 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"math/rand"
 	"net"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -57,6 +62,63 @@ func (*TestConn) SetDeadline(_ time.Time) error      { return nil }
 func (*TestConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (*TestConn) SetWriteDeadline(_ time.Time) error { return nil }
 
+func writeTestStats(rr *rand.Rand, conn *ConnSink, exp *bytes.Buffer) {
+	const MaxInt = 1 << 53
+
+	i := rr.Uint64()
+	name := fmt.Sprintf("name-%d", i)
+
+	conn.FlushCounter(name, uint64(i))
+	fmt.Fprintf(exp, "%s:%d|c\n", name, uint64(i))
+
+	conn.FlushGauge(name, uint64(i))
+	fmt.Fprintf(exp, "%s:%d|g\n", name, uint64(i))
+
+	if i <= MaxInt {
+		conn.FlushTimer(name, float64(i))
+		fmt.Fprintf(exp, "%s:%d|ms\n", name, i)
+	} else {
+		conn.FlushTimer(name, float64(i))
+		fmt.Fprintf(exp, "%s:%f|ms\n", name, float64(i))
+	}
+
+	if i <= MaxInt {
+		i += MaxInt
+	}
+	ff := rr.Float64()
+	f := float64(i) + ff
+	conn.FlushTimer(name, f)
+	fmt.Fprintf(exp, "%s:%f|ms\n", name, f)
+}
+
+func compareStats(t testing.TB, got, want []byte) {
+	t.Helper()
+
+	if !bytes.Equal(got, want) {
+		t.Errorf("%s: want:\n%s\ngot:\n%s\n", t.Name(), want, got)
+
+		// write diff to temp dir for evaluation
+		tmpdir, err := ioutil.TempDir("", "test-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantName := filepath.Join(tmpdir, "want.out")
+		gotName := filepath.Join(tmpdir, "got.out")
+
+		if err := ioutil.WriteFile(wantName, want, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ioutil.WriteFile(gotName, got, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Logf("Output saved for comparision:\n"+
+			"  got:  %[1]q\n  want: %[2]q\n\n"+
+			"  vimdiff %[1]s %[2]s\n\n",
+			gotName, wantName)
+	}
+}
+
 func TestConnSink(t *testing.T) {
 	var buf bytes.Buffer
 	opts := Options{
@@ -68,17 +130,121 @@ func TestConnSink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rr := rand.New(rand.NewSource(time.Now().UnixNano()))
 	var exp bytes.Buffer
-	for i := 0; i < 100; i++ {
-		name := fmt.Sprintf("name-%d", i)
-		conn.FlushCounter(name, uint64(i))
-		fmt.Fprintf(&exp, "%s:%d|c\n", name, uint64(i))
+	for i := 0; i < 10000; i++ {
+		writeTestStats(rr, conn, &exp)
 	}
-	if err := conn.FlushTimeout(time.Millisecond); err != nil {
+
+	start := time.Now()
+	if err := conn.FlushTimeout(time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(buf.Bytes(), exp.Bytes()) {
-		t.Errorf("ConnSink: want:\n%s\ngot:\n%s\n", exp.Bytes(), buf.Bytes())
+	t.Log("flust duration:", time.Since(start))
+
+	compareStats(t, buf.Bytes(), exp.Bytes())
+}
+
+func TestConnSink_Close(t *testing.T) {
+	var buf bytes.Buffer
+	opts := Options{
+		CustomDialer: &TestConn{
+			w: &buf,
+		},
+	}
+	conn, err := opts.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exp bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rr := rand.New(rand.NewSource(time.Now().UnixNano()))
+		for i := 0; i < 100; i++ {
+			writeTestStats(rr, conn, &exp)
+		}
+	}()
+	wg.Wait()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	compareStats(t, buf.Bytes(), exp.Bytes())
+
+	// test second close
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnSink_Close_Hang(t *testing.T) {
+	opts := Options{
+		CustomDialer: &TestConn{
+			w: ioutil.Discard,
+		},
+	}
+	conn, err := opts.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	defer close(done)
+	for i := 0; i < runtime.NumCPU(); i++ {
+		go func(u uint64) {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					conn.FlushCounter("name", u)
+				}
+			}
+		}(uint64(i))
+	}
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+				conn.FlushCounter("name", uint64(i))
+				if i == 5000 {
+					close(ready)
+				}
+			}
+		}
+	}()
+	<-ready
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnSink_PartialWrites(t *testing.T) {
+	tconn := &TestConn{
+		w: ioutil.Discard,
+	}
+	opts := Options{
+		ReconnectWait: 1,
+		CustomDialer:  tconn,
+	}
+	conn, err := opts.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tconn.writeFn = func(p []byte) (int, error) {
+		if len(p) != 0 && p[len(p)-1] != '\n' {
+			t.Error("partial write!")
+		}
+		return len(p), nil
+	}
+	for i := 0; i < 10000; i++ {
+		conn.FlushCounter("name-"+strconv.Itoa(i), uint64(i))
+		if t.Failed() {
+			break
+		}
 	}
 }
 
@@ -269,9 +435,13 @@ func newBenchmarkConnSink(tb testing.TB) (*ConnSink, *TestConn) {
 func BenchmarkConnSink(b *testing.B) {
 	const name = "prefix" + ".__foo=blah_blah.__q=p"
 	conn, tconn := newBenchmarkConnSink(b)
+
+	s := fmt.Sprintf("%s:%d|c\n", name, 1234567)
+	b.SetBytes(int64(len(s)))
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		conn.FlushCounter(name, uint64(i))
+		conn.FlushCounter(name, 1234567)
 		// conn.Flush()
 	}
 	if tconn.DialCount() != 1 {
@@ -282,12 +452,14 @@ func BenchmarkConnSink(b *testing.B) {
 func BenchmarkConnSink_Parallel(b *testing.B) {
 	const name = "prefix" + ".__foo=blah_blah.__q=p"
 	conn, tconn := newBenchmarkConnSink(b)
+
+	s := fmt.Sprintf("%s:%d|c\n", name, 1234567)
+	b.SetBytes(int64(len(s)))
+
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		u := uint64(0)
 		for pb.Next() {
-			conn.FlushCounter(name, u)
-			u++
+			conn.FlushCounter(name, 1234567)
 		}
 	})
 	if tconn.DialCount() != 1 {

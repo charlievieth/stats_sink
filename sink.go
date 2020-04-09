@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/rand"
 	"net"
@@ -52,6 +53,7 @@ type Settings struct {
 	FlushIntervalS int `envconfig:"GOSTATS_FLUSH_INTERVAL_SECONDS" default:"5"`
 }
 
+// WARN: how many of these are actually used?
 type Logger interface {
 	Debug(msg ...interface{})
 	Info(msg ...interface{})
@@ -63,10 +65,14 @@ type Logger interface {
 
 // TODO: organize
 const (
-	DefaultBufferSize       = 32 * 1024
-	DefaultDialTimeout      = time.Second
-	DefaultDrainTimeout     = time.Second * 10
-	DefaultFlushInterval    = time.Second
+	DefaultBufferSize    = 32 * 1024
+	DefaultDialTimeout   = time.Second
+	DefaultDrainTimeout  = time.Second * 10
+	DefaultFlushInterval = time.Second
+
+	// WARN: tune this to take the reconnect timeout into account
+	DefaultFlushTimeout = time.Second * 5
+
 	DefaultMaxRetries       = 10
 	DefaultProtocol         = "tcp"
 	DefaultReconnectBufSize = 64 * 1024 * 1024 // 64MB
@@ -144,7 +150,7 @@ type Options struct {
 	CustomDialer CustomDialer
 
 	// TODO: set a no-op logger
-	Log Logger
+	Log *log.Logger
 
 	// NoRandomizeHosts configures whether we randomize the order of hosts when
 	// connecting.
@@ -303,6 +309,7 @@ func (c *ConnSink) connect() error {
 
 	dialer := c.Opts.CustomDialer
 	if dialer == nil {
+		// TODO: enforce a minimum dial timeout
 		dialer = &net.Dialer{
 			Timeout: c.Opts.DialTimeout / time.Duration(len(hosts)),
 		}
@@ -347,6 +354,7 @@ func (c *ConnSink) FlushTimeout(timeout time.Duration) error {
 	if status.Is(statusClosed) {
 		return ErrConnectionClosed
 	}
+	// TODO: jigger reconnect ???
 
 	t := getTimer(timeout)
 	ch := make(chan struct{}, 1)
@@ -369,9 +377,9 @@ func (c *ConnSink) FlushTimeout(timeout time.Duration) error {
 
 // no error so that we implement gostats Flusher()
 func (c *ConnSink) Flush() {
-	if err := c.FlushTimeout(time.Second * 10); err != nil {
+	if err := c.FlushTimeout(DefaultFlushTimeout); err != nil {
 		if c.Opts.Log != nil {
-			c.Opts.Log.Error("[stats] flush: " + err.Error())
+			c.Opts.Log.Println("[stats] flush: " + err.Error())
 		}
 	}
 }
@@ -498,7 +506,7 @@ func (c *ConnSink) reconnect() {
 			sleep = c.Opts.ReconnectWait - d
 		}
 		// use a short sleep on the first reconnect attempt
-		if i == 0 && sleep > MaxFirstAttemptDuration {
+		if i == 0 && sleep >= MaxFirstAttemptDuration {
 			sleep = MaxFirstAttemptDuration
 		}
 
@@ -567,7 +575,7 @@ func (c *ConnSink) handleErr(err error) {
 		panic("handleErr: called with nil error")
 	}
 	if c.Opts.Log != nil {
-		c.Opts.Log.Error("[stats] write: " + err.Error())
+		c.Opts.Log.Println("[stats] write: " + err.Error())
 	}
 
 	c.mu.Lock() // TODO (CEV): make sure there isn't a race with c.Opts.Log
@@ -600,6 +608,14 @@ func (c *ConnSink) handleErr(err error) {
 	c.Close()
 }
 
+//////////////////////////////////////////////////////////////////
+
+func (c *ConnSink) XXX() {
+
+}
+
+//////////////////////////////////////////////////////////////////
+
 func (c *ConnSink) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	if c.status.Is(statusDisconnected | statusClosed) {
@@ -617,7 +633,15 @@ func (c *ConnSink) Write(p []byte) (int, error) {
 		}
 	}
 
+	// WARN WARN WARN WARN WARN WARN WARN WARN WARN
 	// WARN: do not write partial stats - flush before !!!
+	if c.bw.Available() < len(p) {
+		// WARN: this is invalid since we don't recheck the condition
+		c.mu.Unlock()
+		c.Flush()
+		c.mu.Lock()
+		// c.bw.Flush() // WARN
+	}
 	n, err := c.bw.Write(p)
 	c.mu.Unlock()
 	if n < len(p) {
@@ -643,8 +667,7 @@ func (c *ConnSink) flushUint64(name, suffix string, u uint64) error {
 
 	_, err := c.Write(*b)
 
-	*b = (*b)[:0]
-	ppFree.Put(b)
+	ppFree.Put(b.Reset())
 	return err // TODO (CEV): don't flush - use Flush() instead
 }
 
@@ -658,8 +681,7 @@ func (c *ConnSink) flushFloat64(name, suffix string, f float64) error {
 
 	_, err := c.Write(*b)
 
-	*b = (*b)[:0]
-	ppFree.Put(b)
+	ppFree.Put(b.Reset())
 	return err // TODO (CEV): don't flush - use Flush() instead
 }
 
@@ -672,14 +694,16 @@ func (c *ConnSink) FlushGauge(name string, value uint64) {
 }
 
 func (c *ConnSink) FlushTimer(name string, value float64) {
-	const MaxUint64 float64 = 1<<64 - 1
+	// MaxInt is the largest integer that can be stored in a double
+	// precision float without losing precision.
+	const MaxInt = 1 << 53
 
 	// Since we mistakenly use floating point values to represent time
 	// durations this method is often passed an integer encoded as a
 	// float. Formatting integers is much faster (>2x) than formatting
 	// floats so use integer formatting whenever possible.
 	//
-	if 0 <= value && value < MaxUint64 && math.Trunc(value) == value {
+	if 0 <= value && value <= MaxInt && math.Trunc(value) == value {
 		c.flushUint64(name, "|ms\n", uint64(value))
 	} else {
 		c.flushFloat64(name, "|ms\n", value)
@@ -759,6 +783,55 @@ func (w *timeoutWriter) Write(b []byte) (int, error) {
 	return n, w.err
 }
 
+//////////////////////////////////////////////////////////////////
+
+// TODO (CEV): rename once we remove bufferPool
+var ppFree = sync.Pool{
+	New: func() interface{} {
+		b := make(buffer, 0, 128)
+		return &b
+	},
+}
+
+// Use a fast and simple buffer for constructing statsd messages
+type buffer []byte
+
+func (b *buffer) Write(p []byte) {
+	*b = append(*b, p...)
+}
+
+func (b *buffer) WriteString(s string) {
+	*b = append(*b, s...)
+}
+
+func (b *buffer) WriteByte(c byte) {
+	*b = append(*b, c)
+}
+
+func (b *buffer) WriteUnit64(val uint64) {
+	var buf [20]byte // big enough for 64bit value base 10
+	i := len(buf) - 1
+	for val >= 10 {
+		q := val / 10
+		buf[i] = byte('0' + val - q*10)
+		i--
+		val = q
+	}
+	buf[i] = byte('0' + val)
+	*b = append(*b, buf[i:]...)
+}
+
+func (b *buffer) WriteFloat64(val float64) {
+	// TODO: use no precision (its faster) ???
+	*b = strconv.AppendFloat(*b, val, 'f', 6, 64)
+}
+
+func (b *buffer) Reset() *buffer {
+	*b = (*b)[:0]
+	return b
+}
+
+/*
 //////////////////////////////////////////////////////////////////
 
 const maxRetries = 10
@@ -842,47 +915,4 @@ func (w *netWriter) writeAndRetry(b []byte, retryCount int) (n int, err error) {
 	}
 	return w.writeAndRetry(b, retryCount)
 }
-
-//////////////////////////////////////////////////////////////////
-
-// TODO (CEV): rename once we remove bufferPool
-var ppFree = sync.Pool{
-	New: func() interface{} {
-		b := make(buffer, 0, 128)
-		return &b
-	},
-}
-
-// Use a fast and simple buffer for constructing statsd messages
-type buffer []byte
-
-func (b *buffer) Write(p []byte) {
-	*b = append(*b, p...)
-}
-
-func (b *buffer) WriteString(s string) {
-	*b = append(*b, s...)
-}
-
-func (b *buffer) WriteByte(c byte) {
-	*b = append(*b, c)
-}
-
-func (b *buffer) WriteUnit64(val uint64) {
-	var buf [20]byte // big enough for 64bit value base 10
-	i := len(buf) - 1
-	for val >= 10 {
-		q := val / 10
-		buf[i] = byte('0' + val - q*10)
-		i--
-		val = q
-	}
-	buf[i] = byte('0' + val)
-	*b = append(*b, buf[i:]...)
-}
-
-func (b *buffer) WriteFloat64(val float64) {
-	// TODO: trim precision to 6 ???
-	// CEV: fmt uses a precision of 6 by default
-	*b = strconv.AppendFloat(*b, val, 'f', -1, 64)
-}
+*/
